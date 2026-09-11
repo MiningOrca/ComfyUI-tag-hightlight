@@ -1,22 +1,20 @@
 import {
-    HYPOTHESIS_TEMPLATE,
+    ML_CATEGORY_DEFINITIONS,
     MODEL_DTYPE,
     MODEL_ID,
-    NLI_CANDIDATE_LABELS,
-    zeroShotOutputToRecord,
+    scoresToRecord,
 } from "./classifier_schema.js";
 
 
 const TRANSFORMERS_URLS = [
-    // Official package CDN entrypoint for vanilla browser ESM.
     "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1",
-    // Fallback through jsDelivr's ESM transform.
     "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm",
 ];
 
 
 let transformers = null;
-let classifier = null;
+let extractor = null;
+let categoryVectors = null;
 let loadPromise = null;
 
 
@@ -49,9 +47,26 @@ async function importTransformers() {
     for (const url of TRANSFORMERS_URLS) {
         try {
             transformers = await import(url);
+
+            self.postMessage({
+                type: "debug",
+                message:
+                    `Transformers.js runtime loaded from ${url}`,
+            });
+
             return transformers;
         } catch (error) {
             lastError = error;
+
+            self.postMessage({
+                type: "debug",
+                message:
+                    `Transformers.js import failed from ${url}`,
+                data:
+                    error instanceof Error
+                        ? error.message
+                        : String(error),
+            });
         }
     }
 
@@ -62,8 +77,20 @@ async function importTransformers() {
 }
 
 
+function dot(a, b) {
+    let sum = 0;
+    const length = Math.min(a.length, b.length);
+
+    for (let i = 0; i < length; i += 1) {
+        sum += a[i] * b[i];
+    }
+
+    return sum;
+}
+
+
 async function ensureLoaded() {
-    if (classifier) return;
+    if (extractor && categoryVectors) return;
     if (loadPromise) return loadPromise;
 
     loadPromise = (async () => {
@@ -80,20 +107,14 @@ async function ensureLoaded() {
         env.allowLocalModels = false;
         env.useBrowserCache = true;
 
-        /*
-         * Do not pin ONNX Runtime WASM binaries separately.
-         * Transformers.js knows which runtime version it expects and
-         * loads its matching browser backend itself.
-         */
         self.postMessage({
             type: "status",
             state: "loading-model",
-            message:
-                "Loading zero-shot semantic classifier…",
+            message: "Loading MiniLM semantic classifier…",
         });
 
-        classifier = await pipeline(
-            "zero-shot-classification",
+        extractor = await pipeline(
+            "feature-extraction",
             MODEL_ID,
             {
                 dtype: MODEL_DTYPE,
@@ -109,28 +130,57 @@ async function ensureLoaded() {
 
         self.postMessage({
             type: "status",
-            state: "ready",
+            state: "loading-taxonomy",
+            message: "Embedding semantic categories…",
+        });
+
+        const entries =
+            Object.entries(ML_CATEGORY_DEFINITIONS)
+                .map(([category, definition]) => ({
+                    category,
+                    text: `${category}: ${definition}`,
+                }));
+
+        const tensor = await extractor(
+            entries.map((item) => item.text),
+            {
+                pooling: "mean",
+                normalize: true,
+            }
+        );
+
+        const rows = tensor.tolist();
+
+        categoryVectors =
+            entries.map((item, index) => ({
+                category: item.category,
+                vector: rows[index],
+            }));
+
+        self.postMessage({
+            type: "debug",
             message:
-                "Zero-shot semantic classifier ready",
+                `MiniLM classifier loaded • model=${MODEL_ID} • dtype=${MODEL_DTYPE} • categories=${categoryVectors.length}`,
+        });
+
+        self.postMessage({
+            type: "status",
+            state: "ready",
+            message: "MiniLM semantic classifier ready",
         });
     })();
 
     try {
         await loadPromise;
     } catch (error) {
-        classifier = null;
+        extractor = null;
+        categoryVectors = null;
         loadPromise = null;
         throw error;
     }
 }
 
 
-/**
- * Run each short prompt tag as a single-label zero-shot classification task.
- *
- * We deliberately do not batch candidate-label prompts ourselves. The
- * Transformers.js zero-shot pipeline owns tokenization/NLI formatting.
- */
 async function classify(tags) {
     await ensureLoaded();
 
@@ -139,40 +189,37 @@ async function classify(tags) {
     const texts =
         tags.map((item) => item.text);
 
-    const outputs = await classifier(
+    self.postMessage({
+        type: "debug",
+        message:
+            `MiniLM inference start • ${texts.length} tag${texts.length === 1 ? "" : "s"}`,
+        data: texts,
+    });
+
+    const tensor = await extractor(
         texts,
-        NLI_CANDIDATE_LABELS,
         {
-            hypothesis_template:
-                HYPOTHESIS_TEMPLATE,
-            multi_label: false,
+            pooling: "mean",
+            normalize: true,
         }
     );
 
-    /*
-     * For an array input Transformers.js returns one zero-shot result per
-     * sequence. Keep a defensive single-input fallback in case a future
-     * version returns the object directly for a one-element batch.
-     */
-    const batch =
-        Array.isArray(outputs)
-            ? outputs
-            : [outputs];
+    const rows = tensor.tolist();
 
-    if (batch.length !== tags.length) {
-        throw new Error(
-            "Zero-shot classifier returned " +
-            `${batch.length} results for ${tags.length} tags`
+    return tags.map((item, index) => {
+        const vector = rows[index];
+
+        const scores =
+            categoryVectors.map((category) => ({
+                category: category.category,
+                score: dot(vector, category.vector),
+            }));
+
+        return scoresToRecord(
+            item.tag,
+            scores
         );
-    }
-
-    return batch.map(
-        (output, index) =>
-            zeroShotOutputToRecord(
-                tags[index].tag,
-                output
-            )
-    );
+    });
 }
 
 

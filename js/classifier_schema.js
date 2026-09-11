@@ -1,11 +1,11 @@
 export const MODEL_ID =
-    "MoritzLaurer/deberta-v3-xsmall-zeroshot-v1.1-all-33";
+    "Xenova/all-MiniLM-L6-v2";
 
-export const MODEL_DTYPE = "q8";
+export const MODEL_DTYPE = "int8";
 export const MODEL_VERSION =
-    "MoritzLaurer-deberta-v3-xsmall-zeroshot-v1.1-all-33-q8";
+    "Xenova-all-MiniLM-L6-v2-int8-definition-cosine-v1";
 
-export const TAXONOMY_VERSION = 3;
+export const TAXONOMY_VERSION = 4;
 
 export const CACHE_NAMESPACE =
     `${MODEL_VERSION}:taxonomy-${TAXONOMY_VERSION}:`;
@@ -16,49 +16,55 @@ export function classificationCacheKey(tag) {
 
 export const ML_CATEGORY_DEFINITIONS = Object.freeze({
     subject:
-        "a subject identity, gender, count, or general person descriptor",
+        "a subject identity, gender, count, role, or general character descriptor",
 
     species:
-        "a species, creature type, biological race, or humanoid or animal kind",
+        "a species, creature type, biological race, humanoid kind, or anthropomorphic animal type",
 
     anatomy:
-        "an anatomical body part, physical trait, body shape, color, or appearance",
+        "a concrete body part, appendage, anatomical feature, or creature limb such as horns, wings, tail, ears, hands, claws, or face parts",
+
+    appearance:
+        "a physical appearance trait, body shape, body color, skin tone, makeup, cosmetic detail, or an attractive visual attribute",
 
     pose:
-        "a body pose, posture, gesture, physical action, or limb position",
+        "a body pose, posture, gesture, physical action, limb placement, or interaction of body parts",
 
     expression:
         "a facial expression, emotion, gaze direction, or eye contact",
 
     clothing:
-        "clothing, footwear, armor, jewelry, or a worn accessory",
+        "clothing, costume, armor, footwear, jewelry, or a worn accessory",
 
     sexual:
-        "nudity, sexual anatomy, sexual activity, or explicitly sexual content",
+        "nudity, sexual anatomy, sexual activity, fetish content, or explicitly sexual content",
 
     artist:
-        "an artist, creator, illustrator, photographer, or creator attribution",
+        "an artist, creator, illustrator, photographer, style author, or creator attribution tag",
+
+    aesthetic:
+        "a vibe, fashion aesthetic, mood adjective, subculture look, or overall visual feel such as goth, cute, edgy, elegant, or dark",
 
     style:
-        "an artistic style, medium, rendering technique, or visual aesthetic",
+        "an artistic style, medium, rendering technique, line or shading approach, or named visual art style",
 
     camera:
-        "a camera angle, viewpoint, framing, shot type, perspective, or composition",
+        "a camera angle, viewpoint, framing, shot type, perspective, cropping choice, or composition instruction",
 
     lighting:
-        "lighting, illumination, shadow, glow, or a light source",
+        "lighting, illumination, glow, shadow, contrast, or a light source description",
 
     environment:
-        "a background, scenery, location, environment, setting, or scene prop",
+        "a background, scenery, location, environment, setting, weather, time of day, or scene prop",
 
     quality:
-        "image quality, resolution, sharpness, fidelity, or a quality rating",
+        "image quality, resolution, sharpness, fidelity, or an overall quality rating",
 
     defect:
-        "an unwanted visual defect, malformed anatomy, cropping error, artifact, or generation failure",
+        "an unwanted visual defect, malformed anatomy, cropping error, duplication, missing part, compression artifact, or image generation failure",
 
     text_metadata:
-        "visible text, watermark, logo, signature, creator name, or image metadata",
+        "visible text, letters, watermark, logo, signature, artist name, caption, or image metadata",
 });
 
 export const ML_CATEGORIES =
@@ -74,26 +80,19 @@ export const ALL_CATEGORIES =
         "other",
     ]);
 
-export const NLI_LABEL_TO_CATEGORY = Object.freeze(
-    Object.fromEntries(
-        Object.entries(ML_CATEGORY_DEFINITIONS).map(
-            ([category, label]) => [label, category]
-        )
-    )
-);
-
-export const NLI_CANDIDATE_LABELS =
-    Object.freeze(Object.keys(NLI_LABEL_TO_CATEGORY));
-
-export const HYPOTHESIS_TEMPLATE =
-    "This prompt tag describes {}.";
-
-export const DEFAULT_MIN_SCORE = 0.16;
-export const DEFAULT_MIN_MARGIN = 0.025;
+/*
+ * MiniLM cosine scores from the real browser benchmark clustered around
+ * ~0.23–0.54 for useful semantic matches. A 0.20 floor rejects weak/opaque
+ * tags while retaining the observed good booru-style matches. Margin is not
+ * used by default because several valid categories are naturally close in
+ * embedding space; it remains configurable in Settings.
+ */
+export const DEFAULT_MIN_SCORE = 0.20;
+export const DEFAULT_MIN_MARGIN = 0.0;
 
 
 /**
- * Backward compatibility for overrides created by the MiniLM prototype version.
+ * Backward compatibility for overrides created by older versions.
  * This is category-name migration only; it is not tag-specific classification.
  */
 export function normalizeCategory(category) {
@@ -104,24 +103,23 @@ export function normalizeCategory(category) {
 }
 
 
-export function zeroShotOutputToRecord(tag, output) {
-    if (
-        !output ||
-        !Array.isArray(output.labels) ||
-        !Array.isArray(output.scores) ||
-        output.labels.length === 0 ||
-        output.labels.length !== output.scores.length
-    ) {
+export function scoresToRecord(tag, scores) {
+    if (!Array.isArray(scores) || !scores.length) {
         throw new Error(
-            "Invalid zero-shot classifier output: expected equally sized labels/scores arrays"
+            "Invalid cosine classifier output: expected a non-empty score array"
         );
     }
 
-    const ranked = output.labels.map((label, index) => ({
-        label,
-        category: NLI_LABEL_TO_CATEGORY[label] ?? "other",
-        score: Number(output.scores[index]),
+    const ranked = scores.map((item) => ({
+        category: String(item?.category ?? "other"),
+        score: Number(item?.score),
     }));
+
+    if (ranked.some((item) => !Number.isFinite(item.score))) {
+        throw new Error(
+            "Invalid cosine classifier output: score must be finite"
+        );
+    }
 
     ranked.sort((a, b) => b.score - a.score);
 
@@ -132,18 +130,14 @@ export function zeroShotOutputToRecord(tag, output) {
 
     const second = ranked[1] ?? {
         category: "other",
-        score: 0,
+        score: best.score,
     };
 
     return {
         tag,
         category: best.category,
-        score: Number.isFinite(best.score) ? best.score : 0,
-        secondScore: Number.isFinite(second.score) ? second.score : 0,
-        margin:
-            Number.isFinite(best.score) &&
-            Number.isFinite(second.score)
-                ? best.score - second.score
-                : 0,
+        score: best.score,
+        secondScore: second.score,
+        margin: best.score - second.score,
     };
 }

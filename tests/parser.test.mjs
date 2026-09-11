@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
     categoryForRecord,
+    classificationDecision,
     normalizeTag,
     parsePrompt,
     syntaxCategory,
@@ -48,27 +49,88 @@ assert.equal(
 assert.equal(
     categoryForRecord(
         {
-            category: "body",
+            category: "anatomy",
             score: 0.7,
             margin: 0.08,
         },
-        0.16,
-        0.025
+        0.10,
+        0.01
     ),
-    "body"
+    "anatomy"
 );
 
 assert.equal(
     categoryForRecord(
         {
-            category: "body",
-            score: 0.7,
-            margin: 0.01,
+            category: "anatomy",
+            score: 0.09,
+            margin: 0.08,
         },
-        0.16,
-        0.025
+        0.10,
+        0.01
     ),
     "other"
+);
+
+
+assert.deepEqual(
+    classificationDecision(
+        null,
+        0.10,
+        0.01
+    ),
+    {
+        category: "other",
+        accepted: false,
+        reason: "missing",
+        score: null,
+        margin: null,
+    }
+);
+
+assert.equal(
+    classificationDecision(
+        {
+            category: "species",
+            score: 0.09,
+            margin: 0.20,
+        },
+        0.10,
+        0.01
+    ).reason,
+    "score<0.1"
+);
+
+assert.equal(
+    classificationDecision(
+        {
+            category: "species",
+            score: 0.70,
+            margin: 0.009,
+        },
+        0.10,
+        0.01
+    ).reason,
+    "margin<0.01"
+);
+
+assert.deepEqual(
+    classificationDecision(
+        {
+            category: "species",
+            score: 0.70,
+            margin: 0.10,
+        },
+        0.10,
+        0.01
+    ),
+    {
+        category: "species",
+        accepted: true,
+        reason: "accepted",
+        score: 0.70,
+        margin: 0.10,
+    }
 );
 
 console.log("parser tests: OK");

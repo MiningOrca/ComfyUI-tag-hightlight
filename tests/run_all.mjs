@@ -1,7 +1,7 @@
 const tests = [
     "./parser.test.mjs",
     "./classifier_schema.test.mjs",
-    "./model_behavior_cases.test.mjs",
+    "./diagnostics_wiring.test.mjs",
 ];
 
 for (const test of tests) {

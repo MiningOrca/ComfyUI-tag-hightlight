@@ -103,15 +103,76 @@ export function parsePrompt(text) {
     return segments;
 }
 
-export function categoryForRecord(record, minScore, minMargin) {
-    if (!record) return "other";
+export function classificationDecision(record, minScore, minMargin) {
+    const scoreThreshold = Number(minScore);
+    const marginThreshold = Number(minMargin);
 
-    if (
-        Number(record.score) >= Number(minScore) &&
-        Number(record.margin) >= Number(minMargin)
-    ) {
-        return record.category;
+    if (!record) {
+        return {
+            category: "other",
+            accepted: false,
+            reason: "missing",
+            score: null,
+            margin: null,
+        };
     }
 
-    return "other";
+    const score = Number(record.score);
+    const margin = Number(record.margin);
+
+    if (!Number.isFinite(score)) {
+        return {
+            category: "other",
+            accepted: false,
+            reason: "invalid-score",
+            score,
+            margin,
+        };
+    }
+
+    if (!Number.isFinite(margin)) {
+        return {
+            category: "other",
+            accepted: false,
+            reason: "invalid-margin",
+            score,
+            margin,
+        };
+    }
+
+    if (score < scoreThreshold) {
+        return {
+            category: "other",
+            accepted: false,
+            reason: `score<${scoreThreshold}`,
+            score,
+            margin,
+        };
+    }
+
+    if (margin < marginThreshold) {
+        return {
+            category: "other",
+            accepted: false,
+            reason: `margin<${marginThreshold}`,
+            score,
+            margin,
+        };
+    }
+
+    return {
+        category: record.category,
+        accepted: true,
+        reason: "accepted",
+        score,
+        margin,
+    };
+}
+
+export function categoryForRecord(record, minScore, minMargin) {
+    return classificationDecision(
+        record,
+        minScore,
+        minMargin
+    ).category;
 }

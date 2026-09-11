@@ -2,6 +2,7 @@ import { app } from "../../scripts/app.js";
 
 import {
     categoryForRecord,
+    classificationDecision,
     normalizeTag,
     parsePrompt,
 } from "./prompt_parser.js";
@@ -17,9 +18,8 @@ import {
     normalizeCategory,
 } from "./classifier_schema.js";
 
+
 import {
-    clearClassifications,
-    clearOverrides,
     deleteOverride,
     getClassifications,
     getOverrides,
@@ -34,45 +34,23 @@ const STATE_PROPERTY = "__semantic_tag_highlighter";
 const CATEGORIES = ALL_CATEGORIES;
 
 /*
- * NLI is O(tags × candidate labels), unlike embedding classification.
- * Keep batches deliberately small so colors appear progressively and so
- * multiple prompt widgets never launch competing model inference calls.
+ * MiniLM is fast enough to classify a normal prompt in one batch. Keep a
+ * moderate cap to avoid pathological giant text widgets.
  */
-const CLASSIFY_BATCH_SIZE = 4;
-
-/*
- * These are TEST CASES, not classifier rules. They are never passed into the
- * taxonomy/category definitions. The browser self-test runs the actual model
- * and reports both accuracy and wall-clock inference time.
- */
-const MODEL_SELF_TEST_CASES = Object.freeze([
-    ["human", "species"],
-    ["anthro dragon", "species"],
-    ["perfect eyes", "anatomy"],
-    ["tan skin", "anatomy"],
-    ["looking at viewer", "expression"],
-    ["hand between legs", "pose"],
-    ["school uniform", "clothing"],
-    ["nude", "sexual"],
-    ["cel shading", "style"],
-    ["three quarter view", "camera"],
-    ["rim lighting", "lighting"],
-    ["forest background", "environment"],
-    ["low quality", "quality"],
-    ["extra fingers", "defect"],
-    ["watermark", "text_metadata"],
-]);
+const CLASSIFY_BATCH_SIZE = 32;
 
 const COLOR_DEFAULTS = {
     subject: "#82aaff",
     species: "#c792ea",
     anatomy: "#f78c6c",
+    appearance: "#ff9e64",
     pose: "#ffcb6b",
     expression: "#f07178",
     clothing: "#89ddff",
     sexual: "#ff7ab2",
     artist: "#b4f9f8",
-    style: "#c3e88d",
+    aesthetic: "#c3e88d",
+    style: "#a6da95",
     camera: "#80cbc4",
     lighting: "#ffd580",
     environment: "#addb67",
@@ -86,9 +64,9 @@ const COLOR_DEFAULTS = {
 
 const SETTINGS = {
     enabled: "SemanticTagHighlighter.Enabled",
-    showButtons: "SemanticTagHighlighter.ShowEnableButtons",
-    minScore: "SemanticTagHighlighter.NliMinScore",
-    minMargin: "SemanticTagHighlighter.NliMinMargin",
+    debugLogging: "SemanticTagHighlighter.DebugLogging",
+    minScore: "SemanticTagHighlighter.CosineMinScore",
+    minMargin: "SemanticTagHighlighter.CosineMinMargin",
     colors: Object.fromEntries(
         Object.keys(COLOR_DEFAULTS).map(
             (category) => [
@@ -109,6 +87,23 @@ const checkedOverrides = new Set();
 let scanTimer = null;
 let rafId = null;
 let globalStatusPill = null;
+let diagnosticTimer = null;
+
+const diagnosticState = {
+    phase: "idle",
+    message: "idle",
+    queued: 0,
+    busy: false,
+    classified: 0,
+    accepted: 0,
+    rejected: 0,
+    cacheHits: 0,
+    cacheRejected: 0,
+    lastBatchMs: null,
+    batchStartedAt: null,
+    lastOutcome: "",
+    error: null,
+};
 
 
 function settingValue(id, fallback) {
@@ -161,8 +156,9 @@ function pluginEnabled() {
     return Boolean(settingValue(SETTINGS.enabled, true));
 }
 
-function buttonsEnabled() {
-    return Boolean(settingValue(SETTINGS.showButtons, true));
+
+function debugLoggingEnabled() {
+    return Boolean(settingValue(SETTINGS.debugLogging, true));
 }
 
 function getNodeState(node) {
@@ -219,26 +215,89 @@ function widgetStateKey(widget) {
     return String(widget?.name ?? widgetLogicalName(widget));
 }
 
-function getTextarea(widget) {
-    if (!widget) return null;
+function getTextareas(widget) {
+    if (!widget) return [];
 
-    if (widget.element instanceof HTMLTextAreaElement) {
-        return widget.element;
+    const found = [];
+    const seen = new Set();
+
+    const add = (element) => {
+        if (
+            !(element instanceof HTMLTextAreaElement) ||
+            seen.has(element)
+        ) {
+            return;
+        }
+
+        seen.add(element);
+        found.push(element);
+    };
+
+    add(widget.element);
+    add(widget.inputEl);
+    add(widget.__dptTextarea);
+
+    for (const container of [widget.element, widget.inputEl]) {
+        if (
+            !(container instanceof HTMLElement) ||
+            container instanceof HTMLTextAreaElement
+        ) {
+            continue;
+        }
+
+        for (const textarea of container.querySelectorAll("textarea")) {
+            add(textarea);
+        }
     }
 
-    if (widget.inputEl instanceof HTMLTextAreaElement) {
-        return widget.inputEl;
-    }
+    return found;
+}
 
-    if (widget.__dptTextarea instanceof HTMLTextAreaElement) {
-        return widget.__dptTextarea;
-    }
 
-    if (widget.element instanceof HTMLElement) {
-        return widget.element.querySelector("textarea");
+function textareaExplicitName(textarea) {
+    const candidates = [
+        textarea?.dataset?.name,
+        textarea?.dataset?.field,
+        textarea?.getAttribute?.("name"),
+        textarea?.getAttribute?.("aria-label"),
+        textarea?.getAttribute?.("placeholder"),
+    ];
+
+    for (const candidate of candidates) {
+        const value = String(candidate ?? "").trim();
+
+        if (value && value.length <= 80) {
+            return value;
+        }
     }
 
     return null;
+}
+
+
+function widgetTextareaStateKey(widget, textarea, index) {
+    const base = widgetStateKey(widget);
+
+    if (index === 0) {
+        return base;
+    }
+
+    const explicit = textareaExplicitName(textarea);
+
+    return explicit
+        ? `${base}::${explicit}`
+        : `${base}::textarea:${index + 1}`;
+}
+
+
+function widgetTextareaLabel(widget, textarea, index, total) {
+    const explicit = textareaExplicitName(textarea);
+    if (explicit) return explicit;
+
+    const base = widgetLogicalName(widget);
+    return total > 1
+        ? `${base} #${index + 1}`
+        : base;
 }
 
 function ensureGlobalStatusPill() {
@@ -255,10 +314,212 @@ function ensureGlobalStatusPill() {
     return pill;
 }
 
-function setGlobalStatus(message, visible = true) {
+function hasEnabledFields() {
+    return [...controllers].some(
+        (controller) =>
+            controller.isEnabledInWorkflow?.()
+    );
+}
+
+function renderGlobalStatus() {
     const pill = ensureGlobalStatusPill();
-    pill.textContent = message;
-    pill.style.display = visible ? "block" : "none";
+
+    const shouldShow =
+        pluginEnabled() &&
+        (
+            hasEnabledFields() ||
+            diagnosticState.phase !== "idle" ||
+            diagnosticState.error
+        );
+
+    if (!shouldShow) {
+        pill.style.display = "none";
+        return;
+    }
+
+    const elapsed =
+        diagnosticState.busy &&
+        diagnosticState.batchStartedAt
+            ? performance.now() -
+              diagnosticState.batchStartedAt
+            : diagnosticState.lastBatchMs;
+
+    const timing =
+        Number.isFinite(elapsed)
+            ? ` • ${(elapsed / 1000).toFixed(1)}s`
+            : "";
+
+    const cachePart =
+        diagnosticState.cacheHits
+            ? ` • cache ${diagnosticState.cacheHits}` +
+              (
+                  diagnosticState.cacheRejected
+                      ? ` (${diagnosticState.cacheRejected} white)`
+                      : ""
+              )
+            : "";
+
+    const sessionPart =
+        diagnosticState.classified
+            ? `new ${diagnosticState.classified}` +
+              ` • colored ${diagnosticState.accepted}` +
+              ` • white ${diagnosticState.rejected}`
+            : "new 0";
+
+    pill.dataset.phase =
+        diagnosticState.error
+            ? "error"
+            : diagnosticState.phase;
+
+    pill.textContent =
+        `Semantic tags • ${diagnosticState.phase}${timing}\n` +
+        `queue ${diagnosticState.queued}` +
+        ` • ${sessionPart}${cachePart}` +
+        (
+            diagnosticState.message &&
+            diagnosticState.message !== diagnosticState.phase
+                ? `\n${diagnosticState.message}`
+                : ""
+        ) +
+        (
+            diagnosticState.lastOutcome
+                ? `\nlast: ${diagnosticState.lastOutcome}`
+                : ""
+        );
+
+    pill.style.display = "block";
+}
+
+function setGlobalStatus(
+    message,
+    visible = true,
+    phase = null
+) {
+    if (phase) {
+        diagnosticState.phase = phase;
+    }
+
+    diagnosticState.message =
+        message || diagnosticState.phase || "idle";
+
+    if (!visible) {
+        diagnosticState.phase = "idle";
+        diagnosticState.message = "idle";
+        diagnosticState.busy = false;
+        diagnosticState.batchStartedAt = null;
+    }
+
+    renderGlobalStatus();
+}
+
+function debugLog(level, message, data = undefined) {
+    if (!debugLoggingEnabled()) return;
+
+    const prefix = "[Semantic Tag Highlighter]";
+    const fn =
+        level === "error"
+            ? console.error
+            : level === "warn"
+                ? console.warn
+                : level === "debug"
+                    ? console.debug
+                    : console.info;
+
+    if (data === undefined) {
+        fn(`${prefix} ${message}`);
+    } else {
+        fn(`${prefix} ${message}`, data);
+    }
+}
+
+function decisionRow(tag, record, source) {
+    const decision =
+        classificationDecision(
+            record,
+            minScore(),
+            minMargin()
+        );
+
+    return {
+        tag,
+        source,
+        rawCategory:
+            record?.category ?? "<none>",
+        score:
+            Number.isFinite(Number(record?.score))
+                ? Number(record.score).toFixed(4)
+                : "",
+        margin:
+            Number.isFinite(Number(record?.margin))
+                ? Number(record.margin).toFixed(4)
+                : "",
+        effectiveCategory:
+            decision.category,
+        accepted:
+            decision.accepted,
+        reason:
+            decision.reason,
+    };
+}
+
+function logDecisionTable(source, records) {
+    const rows =
+        records.map(
+            (record) =>
+                decisionRow(
+                    record.tag,
+                    record,
+                    source
+                )
+        );
+
+    if (debugLoggingEnabled() && rows.length) {
+        console.groupCollapsed(
+            `[Semantic Tag Highlighter] ${source}: ${rows.length} tag${rows.length === 1 ? "" : "s"}`
+        );
+        console.table(rows);
+        console.groupEnd();
+    }
+
+    return rows;
+}
+
+function updateDiagnosticCounts(rows, source) {
+    if (!rows.length) return;
+
+    const rejected =
+        rows.filter(
+            (row) => !row.accepted
+        ).length;
+
+    if (source === "cache") {
+        diagnosticState.cacheHits +=
+            rows.length;
+        diagnosticState.cacheRejected +=
+            rejected;
+    } else if (source === "model") {
+        diagnosticState.classified +=
+            rows.length;
+        diagnosticState.rejected +=
+            rejected;
+        diagnosticState.accepted +=
+            rows.length - rejected;
+    }
+
+    const last = rows.at(-1);
+
+    if (last) {
+        diagnosticState.lastOutcome =
+            `${last.tag} → ` +
+            `${last.effectiveCategory}` +
+            (
+                last.accepted
+                    ? ""
+                    : ` (${last.reason})`
+            );
+    }
+
+    renderGlobalStatus();
 }
 
 function formatProgress(info) {
@@ -302,6 +563,11 @@ class ClassificationCoordinator {
     ensureWorker() {
         if (this.worker) return this.worker;
 
+        debugLog(
+            "info",
+            `starting classifier worker • model=${MODEL_VERSION} • taxonomy=${TAXONOMY_VERSION}`
+        );
+
         this.worker = new Worker(
             new URL("./classifier_worker.js", import.meta.url),
             { type: "module" }
@@ -315,12 +581,21 @@ class ClassificationCoordinator {
         this.worker.addEventListener("error", (event) => {
             this.failed = true;
             this.busy = false;
+            diagnosticState.busy = false;
+            diagnosticState.error =
+                event.message ||
+                "Classifier worker failed";
+            diagnosticState.phase = "error";
+            diagnosticState.message =
+                diagnosticState.error;
             this.resolveIdleWaiters();
 
-            setGlobalStatus(
-                "Semantic classifier failed",
-                true
+            debugLog(
+                "error",
+                "classifier worker error",
+                event
             );
+            renderGlobalStatus();
 
             toast(
                 "error",
@@ -347,6 +622,21 @@ class ClassificationCoordinator {
 
         this.pending.set(tag, text);
         this.queuedOrInflight.add(tag);
+
+        diagnosticState.queued =
+            this.pending.size;
+        diagnosticState.phase =
+            this.busy
+                ? "classifying"
+                : "queued";
+        diagnosticState.message =
+            `queued: ${tag}`;
+
+        debugLog(
+            "debug",
+            `queued "${tag}" • pending=${this.pending.size}`
+        );
+        renderGlobalStatus();
 
         clearTimeout(this.timer);
 
@@ -414,10 +704,34 @@ class ClassificationCoordinator {
         );
 
         if (kind === "normal") {
-            setGlobalStatus(
-                `Classifying ${batch.length} tag${batch.length === 1 ? "" : "s"}…`,
-                true
+            diagnosticState.phase =
+                "classifying";
+            diagnosticState.busy = true;
+            diagnosticState.batchStartedAt =
+                performance.now();
+            diagnosticState.queued =
+                this.pending.size;
+            diagnosticState.message =
+                `batch: ${batch.map((item) => item.tag).join(", ")}`;
+
+            debugLog(
+                "info",
+                `classifying batch ${requestId}`,
+                {
+                    tags:
+                        batch.map(
+                            (item) => item.tag
+                        ),
+                    pending:
+                        this.pending.size,
+                    minScore:
+                        minScore(),
+                    minMargin:
+                        minMargin(),
+                }
             );
+
+            renderGlobalStatus();
         }
 
         this.ensureWorker().postMessage({
@@ -487,35 +801,45 @@ class ClassificationCoordinator {
         if (!message) return;
 
         if (message.type === "progress") {
-            setGlobalStatus(
-                formatProgress(message.info),
-                true
+            diagnosticState.phase =
+                "loading";
+            diagnosticState.message =
+                formatProgress(message.info);
+
+            debugLog(
+                "debug",
+                diagnosticState.message,
+                message.info
             );
+            renderGlobalStatus();
             return;
         }
 
         if (message.type === "status") {
-            if (message.state === "ready") {
-                setGlobalStatus(
-                    "Semantic model ready",
-                    true
-                );
+            diagnosticState.phase =
+                message.state === "ready"
+                    ? "ready"
+                    : "loading";
+            diagnosticState.message =
+                message.message ||
+                "Loading semantic model…";
 
-                setTimeout(
-                    () =>
-                        setGlobalStatus(
-                            "",
-                            false
-                        ),
-                    1200
-                );
-            } else {
-                setGlobalStatus(
-                    message.message ||
-                        "Loading semantic model…",
-                    true
-                );
-            }
+            debugLog(
+                "info",
+                `worker status: ${message.state}`,
+                message
+            );
+            renderGlobalStatus();
+            return;
+        }
+
+        if (message.type === "debug") {
+            debugLog(
+                "debug",
+                message.message ||
+                    "worker debug",
+                message.data
+            );
             return;
         }
 
@@ -543,6 +867,30 @@ class ClassificationCoordinator {
             }
 
             this.busy = false;
+            diagnosticState.busy = false;
+            diagnosticState.batchStartedAt = null;
+            diagnosticState.phase = "error";
+            diagnosticState.error =
+                message.message ||
+                "Classification failed";
+            diagnosticState.message =
+                diagnosticState.error;
+            diagnosticState.queued =
+                this.pending.size;
+
+            debugLog(
+                "error",
+                `classification request ${message.requestId} failed`,
+                {
+                    error:
+                        diagnosticState.error,
+                    batch:
+                        request.batch.map(
+                            (item) => item.tag
+                        ),
+                }
+            );
+            renderGlobalStatus();
 
             request.reject?.(
                 new Error(
@@ -666,6 +1014,16 @@ class ClassificationCoordinator {
                     return record;
                 });
 
+        const decisionRows =
+            logDecisionTable(
+                "model",
+                records
+            );
+        updateDiagnosticCounts(
+            decisionRows,
+            "model"
+        );
+
         try {
             await putClassifications(
                 records
@@ -679,35 +1037,59 @@ class ClassificationCoordinator {
         }
 
         /*
-         * Paint after every small batch instead of waiting for an entire
-         * prompt. This makes slow NLI progress visible.
+         * Paint after each batch so newly classified tags become visible
+         * immediately even for unusually large text widgets.
          */
         refreshAll();
 
         const remaining =
             this.pending.size;
 
-        setGlobalStatus(
-            remaining
-                ? `Classified ${records.length} tags in ${(elapsedMs / 1000).toFixed(1)}s; ${remaining} queued…`
-                : `Classified ${records.length} tags in ${(elapsedMs / 1000).toFixed(1)}s`,
-            true
+        diagnosticState.lastBatchMs =
+            elapsedMs;
+        diagnosticState.batchStartedAt =
+            null;
+        diagnosticState.busy = false;
+        diagnosticState.queued =
+            remaining;
+        diagnosticState.error = null;
+
+        debugLog(
+            "info",
+            `batch ${message.requestId} finished in ${(elapsedMs / 1000).toFixed(2)}s`,
+            {
+                classified:
+                    records.length,
+                pending:
+                    remaining,
+                accepted:
+                    decisionRows.filter(
+                        (row) => row.accepted
+                    ).length,
+                rejected:
+                    decisionRows.filter(
+                        (row) => !row.accepted
+                    ).length,
+            }
         );
 
         if (remaining) {
+            diagnosticState.phase =
+                "queued";
+            diagnosticState.message =
+                `${remaining} tag${remaining === 1 ? "" : "s"} waiting`;
+            renderGlobalStatus();
+
             setTimeout(
                 () => this.flush(),
                 0
             );
         } else {
-            setTimeout(
-                () =>
-                    setGlobalStatus(
-                        "",
-                        false
-                    ),
-                1800
-            );
+            diagnosticState.phase =
+                "idle";
+            diagnosticState.message =
+                "idle";
+            renderGlobalStatus();
 
             this.resolveIdleWaiters();
         }
@@ -757,6 +1139,9 @@ async function hydrateTags(tags) {
                 classificationMisses.map(classificationCacheKey)
             );
 
+            const cacheRecords = [];
+            const cacheMissTags = [];
+
             for (let i = 0; i < classificationMisses.length; i += 1) {
                 const tag = classificationMisses[i];
                 const record = records[i];
@@ -765,7 +1150,31 @@ async function hydrateTags(tags) {
 
                 if (record) {
                     memoryClassifications.set(tag, record);
+                    cacheRecords.push(record);
+                } else {
+                    cacheMissTags.push(tag);
                 }
+            }
+
+            if (cacheRecords.length) {
+                const rows =
+                    logDecisionTable(
+                        "cache",
+                        cacheRecords
+                    );
+
+                updateDiagnosticCounts(
+                    rows,
+                    "cache"
+                );
+            }
+
+            if (cacheMissTags.length) {
+                debugLog(
+                    "info",
+                    `cache miss: ${cacheMissTags.length} tag${cacheMissTags.length === 1 ? "" : "s"}`,
+                    cacheMissTags
+                );
             }
         } catch (error) {
             console.warn(
@@ -997,15 +1406,36 @@ class PromptHighlighter {
 
 
 class FieldController {
-    constructor(node, widget, textarea) {
+    constructor(
+        node,
+        widget,
+        textarea,
+        key,
+        label
+    ) {
         this.node = node;
         this.widget = widget;
         this.textarea = textarea;
-        this.key = widgetStateKey(widget);
-        this.label = widgetLogicalName(widget);
-
-        this.button = null;
+        this.key = key;
+        this.label = label;
         this.highlighter = null;
+
+        this.onContextMenu = (event) => {
+            if (event.shiftKey) {
+                // Shift+right-click keeps the native browser text menu available.
+                return;
+            }
+
+            void openSemanticTagContextMenu(
+                this,
+                event
+            );
+        };
+
+        this.textarea.addEventListener(
+            "contextmenu",
+            this.onContextMenu
+        );
 
         controllers.add(this);
         controllersByTextarea.set(textarea, this);
@@ -1022,23 +1452,13 @@ class FieldController {
     syncEnabledState() {
         if (!pluginEnabled()) {
             this.destroyHighlighter();
-            this.removeButton();
             return;
         }
 
-        const enabled = this.isEnabledInWorkflow();
-
-        if (enabled) {
+        if (this.isEnabledInWorkflow()) {
             this.ensureHighlighter();
         } else {
             this.destroyHighlighter();
-        }
-
-        if (buttonsEnabled()) {
-            this.ensureButton();
-            this.updateButtonState(enabled);
-        } else {
-            this.removeButton();
         }
     }
 
@@ -1051,69 +1471,24 @@ class FieldController {
         }
 
         this.syncEnabledState();
+        renderGlobalStatus();
     }
 
     disable() {
         const state = getNodeState(this.node);
 
-        state.enabledWidgets = state.enabledWidgets.filter(
-            (key) => key !== this.key
-        );
+        state.enabledWidgets =
+            state.enabledWidgets.filter(
+                (key) => key !== this.key
+            );
 
         setNodeState(this.node, state);
         this.syncEnabledState();
-    }
-
-    ensureButton() {
-        if (this.button?.isConnected) return;
-
-        const host =
-            this.textarea.offsetParent ??
-            this.textarea.parentElement;
-
-        if (!host) return;
-
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "sth-enable-button";
-
-        button.addEventListener("click", (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-
-            // The field button is intentionally enable-only.
-            // Disable from the node context menu/options.
-            if (!this.isEnabledInWorkflow()) {
-                this.enable();
-            }
-        });
-
-        host.appendChild(button);
-        this.button = button;
-        this.buttonHost = host;
-
-        this.updateButtonState(this.isEnabledInWorkflow());
-    }
-
-    updateButtonState(enabled) {
-        if (!this.button) return;
-
-        this.button.textContent = enabled ? "Tags ✓" : "Tags";
-        this.button.classList.toggle("sth-active", enabled);
-
-        this.button.title = enabled
-            ? `Semantic tag highlighting is enabled for "${this.label}". Disable it from the node menu.`
-            : `Enable semantic tag highlighting for "${this.label}"`;
-    }
-
-    removeButton() {
-        this.button?.remove();
-        this.button = null;
+        renderGlobalStatus();
     }
 
     ensureHighlighter() {
         if (this.highlighter) return;
-
         this.highlighter = new PromptHighlighter(this);
     }
 
@@ -1128,53 +1503,25 @@ class FieldController {
             return;
         }
 
-        if (this.button) {
-            const visible =
-                this.textarea.offsetWidth > 0 &&
-                this.textarea.offsetHeight > 0 &&
-                this.textarea.isConnected;
-
-            this.button.style.display =
-                visible ? "inline-flex" : "none";
-
-            if (visible) {
-                const buttonWidth =
-                    this.button.offsetWidth || 34;
-
-                const left = Math.max(
-                    0,
-                    this.textarea.offsetLeft +
-                    this.textarea.offsetWidth -
-                    buttonWidth -
-                    5
-                );
-
-                const top = Math.max(
-                    0,
-                    this.textarea.offsetTop -
-                    (this.button.offsetHeight || 18) -
-                    3
-                );
-
-                this.button.style.setProperty(
-                    "--sth-left",
-                    `${left}px`
-                );
-
-                this.button.style.setProperty(
-                    "--sth-top",
-                    `${top}px`
-                );
-            }
-        }
-
         this.highlighter?.syncStyle();
     }
 
     destroy() {
-        this.removeButton();
+        this.textarea.removeEventListener(
+            "contextmenu",
+            this.onContextMenu
+        );
+
         this.destroyHighlighter();
+
+        if (
+            controllersByTextarea.get(this.textarea) === this
+        ) {
+            controllersByTextarea.delete(this.textarea);
+        }
+
         controllers.delete(this);
+        renderGlobalStatus();
     }
 }
 
@@ -1185,57 +1532,6 @@ function injectCss() {
     const style = document.createElement("style");
     style.id = "sth-styles";
     style.textContent = `
-        .sth-enable-button {
-            /*
-             * ComfyUI themes apply fairly aggressive global button styles.
-             * Reset them completely so this stays a tiny opt-in control.
-             */
-            all: unset !important;
-            position: absolute !important;
-            left: var(--sth-left, 4px) !important;
-            top: var(--sth-top, 4px) !important;
-            z-index: 2147483000 !important;
-            display: inline-flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            box-sizing: border-box !important;
-
-            width: auto !important;
-            min-width: 0 !important;
-            max-width: none !important;
-            height: 18px !important;
-            min-height: 18px !important;
-            max-height: 18px !important;
-
-            padding: 0 5px !important;
-            margin: 0 !important;
-
-            border: 1px solid color-mix(in srgb, currentColor 25%, transparent) !important;
-            border-radius: 4px !important;
-
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
-            font-size: 10px !important;
-            font-weight: 500 !important;
-            line-height: 16px !important;
-
-            color: var(--input-text, #d7d7d7) !important;
-            background: color-mix(in srgb, var(--comfy-menu-bg, #252525) 94%, transparent) !important;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.24) !important;
-
-            cursor: pointer !important;
-            user-select: none !important;
-            opacity: 0.72 !important;
-        }
-
-        .sth-enable-button:hover {
-            opacity: 1 !important;
-        }
-
-        .sth-enable-button.sth-active {
-            opacity: 0.92 !important;
-            border-color: color-mix(in srgb, currentColor 48%, transparent) !important;
-        }
-
         .sth-overlay {
             position: absolute;
             pointer-events: none;
@@ -1249,19 +1545,87 @@ function injectCss() {
             transform-origin: top left;
         }
 
+        .sth-context-menu {
+            position: fixed;
+            z-index: 2147483644;
+            min-width: 210px;
+            padding: 4px;
+            box-sizing: border-box;
+            border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+            border-radius: 6px;
+            color: var(--input-text, #ddd);
+            background: var(--comfy-menu-bg, #222);
+            box-shadow: 0 6px 24px rgba(0, 0, 0, 0.42);
+            font: 12px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        .sth-context-item {
+            display: flex;
+            width: 100%;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            box-sizing: border-box;
+            padding: 6px 8px;
+            border: 0;
+            border-radius: 4px;
+            color: inherit;
+            background: transparent;
+            text-align: left;
+            cursor: default;
+            user-select: none;
+        }
+
+        .sth-context-item:not(:disabled):hover {
+            background: color-mix(in srgb, currentColor 12%, transparent);
+        }
+
+        .sth-context-item:disabled {
+            opacity: 0.42;
+        }
+
+        .sth-context-separator {
+            height: 1px;
+            margin: 4px 3px;
+            background: color-mix(in srgb, currentColor 14%, transparent);
+        }
+
+        .sth-context-tag {
+            max-width: 280px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            padding: 5px 8px 3px;
+            opacity: 0.68;
+            font: 11px/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+
         .sth-global-status {
             position: fixed;
-            right: 16px;
-            bottom: 16px;
+            right: 14px;
+            bottom: 14px;
             z-index: 2147483640;
-            max-width: min(480px, calc(100vw - 32px));
-            padding: 7px 10px;
+            width: min(430px, calc(100vw - 28px));
+            box-sizing: border-box;
+            padding: 8px 10px;
             border-radius: 6px;
-            font: 12px/1.35 sans-serif;
+            white-space: pre-wrap;
+            font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
             color: var(--input-text, #ddd);
-            background: color-mix(in srgb, var(--comfy-menu-bg, #252525) 96%, transparent);
+            background: color-mix(in srgb, var(--comfy-menu-bg, #252525) 97%, transparent);
             border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
             box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+            pointer-events: none;
+            opacity: 0.92;
+        }
+
+        .sth-global-status[data-phase="error"] {
+            border-color: #ff6b6b;
+        }
+
+        .sth-global-status[data-phase="classifying"],
+        .sth-global-status[data-phase="loading"] {
+            border-color: #89ddff;
         }
     `;
 
@@ -1273,23 +1637,44 @@ function scanNode(node) {
     if (!node?.widgets) return;
 
     for (const widget of node.widgets) {
-        const textarea = getTextarea(widget);
+        const textareas = getTextareas(widget);
 
-        if (!(textarea instanceof HTMLTextAreaElement)) {
-            continue;
+        for (let index = 0; index < textareas.length; index += 1) {
+            const textarea = textareas[index];
+
+            if (controllersByTextarea.has(textarea)) {
+                continue;
+            }
+
+            const key = widgetTextareaStateKey(
+                widget,
+                textarea,
+                index
+            );
+
+            const label = widgetTextareaLabel(
+                widget,
+                textarea,
+                index,
+                textareas.length
+            );
+
+            debugLog(
+                "info",
+                `textarea discovered • node=${node.comfyClass ?? node.type ?? "unknown"} • field=${label} • key=${key}`
+            );
+
+            new FieldController(
+                node,
+                widget,
+                textarea,
+                key,
+                label
+            );
         }
-
-        if (controllersByTextarea.has(textarea)) {
-            continue;
-        }
-
-        new FieldController(
-            node,
-            widget,
-            textarea
-        );
     }
 }
+
 
 function scanAllNodes() {
     const nodes =
@@ -1324,291 +1709,333 @@ function refreshAll() {
 }
 
 
-async function runClassifierSelfTest() {
-    const cases =
-        MODEL_SELF_TEST_CASES.map(
-            ([tag, expected]) => ({
-                tag,
-                text: tag,
-                expected,
-            })
+
+let activeSemanticMenu = null;
+
+
+function closeSemanticMenu() {
+    if (!activeSemanticMenu) return;
+
+    activeSemanticMenu.cleanup?.();
+    activeSemanticMenu.root?.remove();
+    activeSemanticMenu.submenu?.remove();
+    activeSemanticMenu = null;
+}
+
+
+function tagAtTextareaSelection(textarea) {
+    const value = String(textarea.value ?? "");
+    const start = Number(textarea.selectionStart ?? 0);
+    const end = Number(textarea.selectionEnd ?? start);
+
+    if (end > start) {
+        const selected = normalizeTag(
+            value.slice(start, end)
         );
 
-    for (const item of cases) {
-        if (
-            !ML_CATEGORIES.includes(
-                item.expected
-            )
-        ) {
-            throw new Error(
-                `Invalid self-test category: ${item.expected}`
-            );
+        if (selected && !selected.includes(",")) {
+            return selected;
         }
     }
 
-    setGlobalStatus(
-        `Running real model self-test: ${cases.length} tags…`,
-        true
-    );
+    const segments = parsePrompt(value);
+    let offset = 0;
 
-    try {
-        const {
-            results,
-            elapsedMs,
-        } =
-            await coordinator.classifyForTest(
-                cases
-            );
+    for (const segment of segments) {
+        const length =
+            segment.raw.length +
+            segment.comma.length;
 
-        const byTag =
-            new Map(
-                results.map(
-                    (result) => [
-                        result.tag,
-                        result,
-                    ]
-                )
-            );
+        if (
+            start >= offset &&
+            start <= offset + length
+        ) {
+            return segment.normalized || "";
+        }
 
-        const rows =
-            cases.map((item) => {
-                const raw =
-                    byTag.get(item.tag);
-
-                const actual =
-                    categoryForRecord(
-                        raw,
-                        minScore(),
-                        minMargin()
-                    );
-
-                return {
-                    tag: item.tag,
-                    expected:
-                        item.expected,
-                    actual,
-                    rawCategory:
-                        raw?.category ??
-                        "<missing>",
-                    score:
-                        raw?.score
-                            ?.toFixed?.(3) ??
-                        "",
-                    margin:
-                        raw?.margin
-                            ?.toFixed?.(3) ??
-                        "",
-                    pass:
-                        actual ===
-                        item.expected,
-                };
-            });
-
-        const passed =
-            rows.filter(
-                (row) => row.pass
-            ).length;
-
-        const seconds =
-            elapsedMs / 1000;
-
-        console.group(
-            "[Semantic Tag Highlighter] REAL MODEL SELF-TEST"
-        );
-        console.table(rows);
-        console.log(
-            `Result: ${passed}/${rows.length}; ` +
-            `model inference: ${seconds.toFixed(2)}s; ` +
-            `${(elapsedMs / rows.length).toFixed(0)} ms/tag`
-        );
-        console.groupEnd();
-
-        const failures =
-            rows.filter(
-                (row) => !row.pass
-            );
-
-        const summary =
-            [
-                `Real model: ${passed}/${rows.length} expected categories`,
-                `Inference: ${seconds.toFixed(2)} s total`,
-                `${(elapsedMs / rows.length).toFixed(0)} ms/tag`,
-                "",
-                failures.length
-                    ? "Failures:"
-                    : "No category mismatches.",
-                ...failures.map(
-                    (row) =>
-                        `${row.tag}: expected ${row.expected}, got ${row.actual} ` +
-                        `(raw ${row.rawCategory}, score ${row.score}, margin ${row.margin})`
-                ),
-            ].join("\n");
-
-        setGlobalStatus(
-            `Self-test: ${passed}/${rows.length} in ${seconds.toFixed(1)}s`,
-            true
-        );
-
-        window.alert(
-            "Semantic Tag Highlighter\n\n" +
-            summary +
-            "\n\nFull table was written to the browser console."
-        );
-
-        setTimeout(
-            () =>
-                setGlobalStatus(
-                    "",
-                    false
-                ),
-            2500
-        );
-    } catch (error) {
-        const message =
-            error instanceof Error
-                ? error.message
-                : String(error);
-
-        setGlobalStatus(
-            "Classifier self-test failed",
-            true
-        );
-
-        toast(
-            "error",
-            "Semantic Tag Highlighter",
-            message
-        );
-
-        window.alert(
-            "Semantic Tag Highlighter self-test failed:\n\n" +
-            message
-        );
+        offset += length;
     }
+
+    return "";
 }
 
-async function addOverrideInteractively() {
-    const rawTag = window.prompt(
-        "Tag to override, e.g. looking_at_viewer:"
-    );
 
-    if (rawTag === null) return;
+function placeMenu(element, x, y) {
+    element.style.left = `${Math.max(4, x)}px`;
+    element.style.top = `${Math.max(4, y)}px`;
 
-    const tag = normalizeTag(rawTag);
-
-    if (!tag) {
-        toast(
-            "warn",
-            "Semantic Tag Highlighter",
-            "Tag is empty"
+    requestAnimationFrame(() => {
+        const rect = element.getBoundingClientRect();
+        const left = Math.min(
+            Math.max(4, x),
+            window.innerWidth - rect.width - 4
         );
-        return;
+        const top = Math.min(
+            Math.max(4, y),
+            window.innerHeight - rect.height - 4
+        );
+
+        element.style.left = `${left}px`;
+        element.style.top = `${top}px`;
+    });
+}
+
+
+function menuButton(label, callback, disabled = false) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "sth-context-item";
+    button.textContent = label;
+    button.disabled = Boolean(disabled);
+
+    if (!disabled && callback) {
+        button.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            closeSemanticMenu();
+            void callback();
+        });
     }
+
+    return button;
+}
+
+
+async function editOverrideForTag(tag) {
+    if (!tag) return;
+
+    await hydrateTags([tag]);
+
+    const inferred =
+        categoryForRecord(
+            memoryClassifications.get(tag),
+            minScore(),
+            minMargin()
+        );
 
     const current =
         memoryOverrides.get(tag) ??
-        "expression";
+        (inferred !== "other" ? inferred : "appearance");
 
     const category = window.prompt(
-        `Category for "${tag}":\n${CATEGORIES.join(", ")}`,
+        `Semantic category for "${tag}":\n${CATEGORIES.join(", ")}`,
         current
     );
 
     if (category === null) return;
 
     const normalizedCategory =
-        category.trim().toLowerCase();
+        normalizeCategory(
+            category.trim().toLowerCase()
+        );
 
-    if (!CATEGORIES.includes(normalizedCategory)) {
+    if (
+        normalizedCategory === "other" &&
+        category.trim().toLowerCase() !== "other"
+    ) {
         toast(
             "error",
             "Semantic Tag Highlighter",
-            `Unknown category "${normalizedCategory}"`
+            `Unknown category "${category.trim()}"`
         );
         return;
     }
 
-    const storedCategory =
-        normalizeCategory(normalizedCategory);
-
     await setOverride(
         tag,
-        storedCategory
+        normalizedCategory
     );
 
     memoryOverrides.set(
         tag,
-        storedCategory
+        normalizedCategory
+    );
+    checkedOverrides.add(tag);
+
+    debugLog(
+        "info",
+        `override set • ${tag} → ${normalizedCategory}`
     );
 
-    checkedOverrides.add(tag);
     refreshAll();
 }
 
-async function removeOverrideInteractively() {
-    const rawTag = window.prompt(
-        "Tag whose override should be removed:"
-    );
 
-    if (rawTag === null) return;
-
-    const tag = normalizeTag(rawTag);
+async function removeOverrideForTag(tag) {
     if (!tag) return;
 
     await deleteOverride(tag);
     memoryOverrides.delete(tag);
     checkedOverrides.add(tag);
 
+    debugLog(
+        "info",
+        `override removed • ${tag}`
+    );
+
     refreshAll();
 }
 
-async function clearMlCacheInteractively() {
-    if (
-        !window.confirm(
-            "Clear Semantic Tag Highlighter ML classification cache?\n" +
-            "Manual overrides will be preserved."
-        )
-    ) {
-        return;
-    }
 
-    await clearClassifications();
+async function openSemanticTagContextMenu(
+    controller,
+    event
+) {
+    event.preventDefault();
+    event.stopPropagation();
 
-    memoryClassifications.clear();
-    checkedClassifications.clear();
+    closeSemanticMenu();
 
-    for (const controller of controllers) {
-        controller.highlighter?.update();
-    }
-
-    toast(
-        "success",
-        "Semantic Tag Highlighter",
-        "Classification cache cleared"
+    const tag = tagAtTextareaSelection(
+        controller.textarea
     );
-}
 
-async function clearOverridesInteractively() {
-    if (
-        !window.confirm(
-            "Clear all Semantic Tag Highlighter manual overrides?"
-        )
-    ) {
-        return;
+    if (tag) {
+        await hydrateTags([tag]);
     }
 
-    await clearOverrides();
+    const root = document.createElement("div");
+    root.className = "sth-context-menu";
 
-    memoryOverrides.clear();
-    checkedOverrides.clear();
+    const opener = document.createElement("button");
+    opener.type = "button";
+    opener.className = "sth-context-item";
+    opener.innerHTML =
+        `<span>Semantic tags</span><span>▶</span>`;
+    root.appendChild(opener);
 
-    refreshAll();
+    const submenu = document.createElement("div");
+    submenu.className = "sth-context-menu";
+    submenu.style.display = "none";
 
-    toast(
-        "success",
-        "Semantic Tag Highlighter",
-        "Manual overrides cleared"
+    if (tag) {
+        const tagLine = document.createElement("div");
+        tagLine.className = "sth-context-tag";
+        tagLine.textContent = tag;
+        submenu.appendChild(tagLine);
+    }
+
+    const enabled =
+        controller.isEnabledInWorkflow();
+
+    submenu.appendChild(
+        menuButton(
+            enabled
+                ? "Disable highlighting for this field"
+                : "Enable highlighting for this field",
+            () => {
+                enabled
+                    ? controller.disable()
+                    : controller.enable();
+            }
+        )
     );
+
+    const separator = document.createElement("div");
+    separator.className = "sth-context-separator";
+    submenu.appendChild(separator);
+
+    submenu.appendChild(
+        menuButton(
+            tag
+                ? `Edit override…`
+                : "Edit override… (place caret on a tag)",
+            () => editOverrideForTag(tag),
+            !tag
+        )
+    );
+
+    const hasOverride =
+        Boolean(tag) &&
+        memoryOverrides.has(tag);
+
+    submenu.appendChild(
+        menuButton(
+            hasOverride
+                ? "Remove override"
+                : "Remove override (none set)",
+            () => removeOverrideForTag(tag),
+            !hasOverride
+        )
+    );
+
+    document.body.appendChild(root);
+    document.body.appendChild(submenu);
+
+    const showSubmenu = () => {
+        submenu.style.display = "block";
+
+        const rootRect = root.getBoundingClientRect();
+        const openerRect = opener.getBoundingClientRect();
+        const subRect = submenu.getBoundingClientRect();
+
+        let left = rootRect.right + 4;
+        if (left + subRect.width > window.innerWidth - 4) {
+            left = rootRect.left - subRect.width - 4;
+        }
+
+        const top = Math.min(
+            openerRect.top,
+            window.innerHeight - subRect.height - 4
+        );
+
+        submenu.style.left = `${Math.max(4, left)}px`;
+        submenu.style.top = `${Math.max(4, top)}px`;
+    };
+
+    opener.addEventListener("mouseenter", showSubmenu);
+    opener.addEventListener("click", (clickEvent) => {
+        clickEvent.preventDefault();
+        clickEvent.stopPropagation();
+        showSubmenu();
+    });
+
+    const closeOnPointer = (pointerEvent) => {
+        if (
+            root.contains(pointerEvent.target) ||
+            submenu.contains(pointerEvent.target)
+        ) {
+            return;
+        }
+
+        closeSemanticMenu();
+    };
+
+    const closeOnKey = (keyEvent) => {
+        if (keyEvent.key === "Escape") {
+            closeSemanticMenu();
+        }
+    };
+
+    document.addEventListener(
+        "pointerdown",
+        closeOnPointer,
+        true
+    );
+    document.addEventListener(
+        "keydown",
+        closeOnKey,
+        true
+    );
+
+    activeSemanticMenu = {
+        root,
+        submenu,
+        cleanup: () => {
+            document.removeEventListener(
+                "pointerdown",
+                closeOnPointer,
+                true
+            );
+            document.removeEventListener(
+                "keydown",
+                closeOnKey,
+                true
+            );
+        },
+    };
+
+    placeMenu(root, event.clientX, event.clientY);
 }
 
 
@@ -1646,16 +2073,17 @@ app.registerExtension({
             onChange: () => refreshAll(),
         },
         {
-            id: SETTINGS.showButtons,
+            id: SETTINGS.debugLogging,
             category: [
                 "Semantic Tag Highlighter",
-                "General",
-                "Enable buttons",
+                "Classifier",
+                "Debug logging",
             ],
-            name: "Show 'Highlight tags' buttons on multiline fields",
+            name: "Log classifier activity to browser console",
+            tooltip:
+                "Logs queue/cache/model decisions as console tables, including score, margin and rejection reason.",
             type: "boolean",
             defaultValue: true,
-            onChange: () => refreshAll(),
         },
         {
             id: SETTINGS.minScore,
@@ -1666,7 +2094,7 @@ app.registerExtension({
             ],
             name: "Minimum classification score",
             tooltip:
-                "Below this zero-shot class probability the tag stays uncolored.",
+                "Below this MiniLM cosine similarity the tag stays uncolored.",
             type: "slider",
             attrs: {
                 min: 0,
@@ -1685,7 +2113,7 @@ app.registerExtension({
             ],
             name: "Minimum winner margin",
             tooltip:
-                "Best category must beat the second-best category by at least this amount.",
+                "Best cosine similarity must beat the second-best category by at least this amount.",
             type: "slider",
             attrs: {
                 min: 0,
@@ -1718,6 +2146,14 @@ app.registerExtension({
 
     setup() {
         scanAllNodes();
+        renderGlobalStatus();
+
+        if (!diagnosticTimer) {
+            diagnosticTimer = setInterval(
+                renderGlobalStatus,
+                500
+            );
+        }
 
         if (!scanTimer) {
             scanTimer = setInterval(
@@ -1731,74 +2167,5 @@ app.registerExtension({
                 positionLoop
             );
         }
-    },
-
-    getNodeMenuItems(node) {
-        const nodeControllers = [...controllers].filter(
-            (controller) =>
-                controller.node === node &&
-                controller.isEnabledInWorkflow()
-        );
-
-        if (!nodeControllers.length) {
-            return [];
-        }
-
-        const items = [null];
-
-        for (const controller of nodeControllers) {
-            items.push({
-                content:
-                    `Disable semantic highlighting: ${controller.label}`,
-                callback: () => controller.disable(),
-            });
-        }
-
-        if (nodeControllers.length > 1) {
-            items.push({
-                content:
-                    "Disable semantic highlighting: all fields on this node",
-                callback: () => {
-                    for (const controller of nodeControllers) {
-                        controller.disable();
-                    }
-                },
-            });
-        }
-
-        items.push(
-            {
-                content:
-                    "Semantic Tag Highlighter: run real model self-test…",
-                callback: () =>
-                    runClassifierSelfTest(),
-            },
-            {
-                content:
-                    "Semantic tag override: add/edit…",
-                callback: () =>
-                    addOverrideInteractively(),
-            },
-            {
-                content:
-                    "Semantic tag override: remove…",
-                callback: () =>
-                    removeOverrideInteractively(),
-            },
-            {
-                content:
-                    "Semantic Tag Highlighter: clear ML cache",
-                callback: () =>
-                    clearMlCacheInteractively(),
-            },
-            {
-                content:
-                    "Semantic Tag Highlighter: clear all overrides",
-                callback: () =>
-                    clearOverridesInteractively(),
-            }
-        );
-
-        return items;
-    },
+    }
 });
