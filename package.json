@@ -1,0 +1,9 @@
+{
+  "name": "comfyui-semantic-tag-highlighter",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tests/run_all.mjs",
+    "test:syntax": "node --check js/prompt_parser.js && node --check js/storage.js && node --check js/classifier_schema.js && node --check js/classifier_worker.js && node --check js/semantic_tag_highlighter.js"
+  }
+}
