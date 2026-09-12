@@ -85,6 +85,9 @@ let scanTimer = null;
 let rafId = null;
 let globalStatusPill = null;
 let diagnosticTimer = null;
+let statusFadeTimer = null;
+
+const STATUS_IDLE_HOLD_MS = 5000;
 
 const diagnosticState = {
     phase: "idle",
@@ -318,6 +321,48 @@ function hasEnabledFields() {
     );
 }
 
+function resetGlobalStatusFade(pill) {
+    if (statusFadeTimer) {
+        clearTimeout(statusFadeTimer);
+        statusFadeTimer = null;
+    }
+
+    pill.classList.remove("sth-global-status-faded");
+}
+
+function scheduleGlobalStatusFade(pill) {
+    const idle =
+        diagnosticState.phase === "idle" &&
+        !diagnosticState.busy &&
+        diagnosticState.queued === 0 &&
+        !diagnosticState.error;
+
+    if (!idle) {
+        resetGlobalStatusFade(pill);
+        return;
+    }
+
+    if (
+        statusFadeTimer ||
+        pill.classList.contains("sth-global-status-faded")
+    ) {
+        return;
+    }
+
+    statusFadeTimer = setTimeout(() => {
+        statusFadeTimer = null;
+
+        if (
+            diagnosticState.phase === "idle" &&
+            !diagnosticState.busy &&
+            diagnosticState.queued === 0 &&
+            !diagnosticState.error
+        ) {
+            pill.classList.add("sth-global-status-faded");
+        }
+    }, STATUS_IDLE_HOLD_MS);
+}
+
 function renderGlobalStatus() {
     const pill = ensureGlobalStatusPill();
 
@@ -330,9 +375,12 @@ function renderGlobalStatus() {
         );
 
     if (!shouldShow) {
+        resetGlobalStatusFade(pill);
         pill.style.display = "none";
         return;
     }
+
+    scheduleGlobalStatusFade(pill);
 
     const elapsed =
         diagnosticState.busy &&
@@ -1614,6 +1662,11 @@ function injectCss() {
             box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
             pointer-events: none;
             opacity: 0.92;
+            transition: opacity 800ms ease;
+        }
+
+        .sth-global-status.sth-global-status-faded {
+            opacity: 0;
         }
 
         .sth-global-status[data-phase="error"] {
