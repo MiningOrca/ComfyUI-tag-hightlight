@@ -1,5 +1,5 @@
 import {
-    ML_CATEGORY_DEFINITIONS,
+    ML_CATEGORIES,
     MODEL_DTYPE,
     MODEL_ID,
     scoresToRecord,
@@ -11,10 +11,19 @@ const TRANSFORMERS_URLS = [
     "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm",
 ];
 
+const CLASSIFIER_URL =
+    new URL("./models/semantic_classifier.json", import.meta.url);
+
+const CLASSIFIER_FORMAT =
+    "semantic-tag-highlighter-linear-v1";
+
+const WEIGHT_LAYOUT =
+    "feature-major: weights[input_index * outputDimension + category_index]";
+
 
 let transformers = null;
 let extractor = null;
-let categoryVectors = null;
+let classifier = null;
 let loadPromise = null;
 
 
@@ -77,20 +86,116 @@ async function importTransformers() {
 }
 
 
-function dot(a, b) {
-    let sum = 0;
-    const length = Math.min(a.length, b.length);
-
-    for (let i = 0; i < length; i += 1) {
-        sum += a[i] * b[i];
+function validateClassifier(model) {
+    if (!model || model.format !== CLASSIFIER_FORMAT) {
+        throw new Error(
+            `Unsupported classifier format: ${model?.format ?? "<missing>"}`
+        );
     }
 
-    return sum;
+    if (
+        model.encoder?.id !== MODEL_ID ||
+        model.encoder?.dtype !== MODEL_DTYPE ||
+        model.encoder?.pooling !== "mean" ||
+        model.encoder?.normalized !== true
+    ) {
+        throw new Error(
+            "Classifier encoder metadata does not match the MiniLM runtime"
+        );
+    }
+
+    if (
+        !Number.isInteger(model.inputDimension) ||
+        !Number.isInteger(model.outputDimension) ||
+        model.inputDimension <= 0 ||
+        model.outputDimension <= 0
+    ) {
+        throw new Error("Classifier dimensions are invalid");
+    }
+
+    if (
+        !Array.isArray(model.categories) ||
+        model.categories.length !== model.outputDimension ||
+        model.categories.some(
+            (category, index) =>
+                category !== ML_CATEGORIES[index]
+        )
+    ) {
+        throw new Error(
+            "Classifier categories do not match the production semantic taxonomy"
+        );
+    }
+
+    if (model.weightLayout !== WEIGHT_LAYOUT) {
+        throw new Error(
+            `Unsupported classifier weight layout: ${model.weightLayout}`
+        );
+    }
+
+    if (
+        !Array.isArray(model.weights) ||
+        model.weights.length !==
+            model.inputDimension * model.outputDimension ||
+        model.weights.some((value) => !Number.isFinite(value))
+    ) {
+        throw new Error("Classifier weights are invalid");
+    }
+
+    if (
+        !Array.isArray(model.bias) ||
+        model.bias.length !== model.outputDimension ||
+        model.bias.some((value) => !Number.isFinite(value))
+    ) {
+        throw new Error("Classifier bias is invalid");
+    }
+
+    return model;
+}
+
+
+function linearScores(vector) {
+    if (vector.length !== classifier.inputDimension) {
+        throw new Error(
+            `MiniLM embedding dimension ${vector.length} does not match classifier input ${classifier.inputDimension}`
+        );
+    }
+
+    const scores =
+        classifier.bias.map((value) => Number(value));
+
+    for (
+        let inputIndex = 0;
+        inputIndex < classifier.inputDimension;
+        inputIndex += 1
+    ) {
+        const value = vector[inputIndex];
+        const offset =
+            inputIndex * classifier.outputDimension;
+
+        for (
+            let categoryIndex = 0;
+            categoryIndex < classifier.outputDimension;
+            categoryIndex += 1
+        ) {
+            scores[categoryIndex] +=
+                value *
+                classifier.weights[
+                    offset + categoryIndex
+                ];
+        }
+    }
+
+    return classifier.categories.map(
+        (category, index) => ({
+            category,
+            score: scores[index],
+        })
+    );
 }
 
 
 async function ensureLoaded() {
-    if (extractor && categoryVectors) return;
+    if (extractor && classifier) return;
     if (loadPromise) return loadPromise;
 
     loadPromise = (async () => {
@@ -130,43 +235,34 @@ async function ensureLoaded() {
 
         self.postMessage({
             type: "status",
-            state: "loading-taxonomy",
-            message: "Embedding semantic categories…",
+            state: "loading-classifier",
+            message: "Loading trained semantic classifier…",
         });
 
-        const entries =
-            Object.entries(ML_CATEGORY_DEFINITIONS)
-                .map(([category, definition]) => ({
-                    category,
-                    text: `${category}: ${definition}`,
-                }));
-
-        const tensor = await extractor(
-            entries.map((item) => item.text),
-            {
-                pooling: "mean",
-                normalize: true,
-            }
+        const response = await fetch(
+            CLASSIFIER_URL,
+            { cache: "no-cache" }
         );
 
-        const rows = tensor.tolist();
+        if (!response.ok) {
+            throw new Error(
+                `Could not load trained classifier: HTTP ${response.status}`
+            );
+        }
 
-        categoryVectors =
-            entries.map((item, index) => ({
-                category: item.category,
-                vector: rows[index],
-            }));
+        classifier =
+            validateClassifier(await response.json());
 
         self.postMessage({
             type: "debug",
             message:
-                `MiniLM classifier loaded • model=${MODEL_ID} • dtype=${MODEL_DTYPE} • categories=${categoryVectors.length}`,
+                `MiniLM + linear classifier loaded • encoder=${MODEL_ID} • dtype=${MODEL_DTYPE} • head=${classifier.model} • categories=${classifier.categories.length}`,
         });
 
         self.postMessage({
             type: "status",
             state: "ready",
-            message: "MiniLM semantic classifier ready",
+            message: "Trained semantic classifier ready",
         });
     })();
 
@@ -174,7 +270,7 @@ async function ensureLoaded() {
         await loadPromise;
     } catch (error) {
         extractor = null;
-        categoryVectors = null;
+        classifier = null;
         loadPromise = null;
         throw error;
     }
@@ -209,15 +305,9 @@ async function classify(tags) {
     return tags.map((item, index) => {
         const vector = rows[index];
 
-        const scores =
-            categoryVectors.map((category) => ({
-                category: category.category,
-                score: dot(vector, category.vector),
-            }));
-
         return scoresToRecord(
             item.tag,
-            scores
+            linearScores(vector)
         );
     });
 }

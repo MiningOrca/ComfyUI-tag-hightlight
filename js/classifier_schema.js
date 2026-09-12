@@ -3,9 +3,9 @@ export const MODEL_ID =
 
 export const MODEL_DTYPE = "int8";
 export const MODEL_VERSION =
-    "Xenova-all-MiniLM-L6-v2-int8-definition-cosine-v1";
+    "Xenova-all-MiniLM-L6-v2-int8-linear-svm-c1-reviewed-v1";
 
-export const TAXONOMY_VERSION = 4;
+export const TAXONOMY_VERSION = 5;
 
 export const CACHE_NAMESPACE =
     `${MODEL_VERSION}:taxonomy-${TAXONOMY_VERSION}:`;
@@ -67,8 +67,33 @@ export const ML_CATEGORY_DEFINITIONS = Object.freeze({
         "visible text, letters, watermark, logo, signature, artist name, caption, or image metadata",
 });
 
-export const ML_CATEGORIES =
-    Object.freeze(Object.keys(ML_CATEGORY_DEFINITIONS));
+/*
+ * Categories produced by the trained semantic head.
+ *
+ * "artist" intentionally stays outside the learned head: opaque creator
+ * aliases are handled by explicit overrides / metadata instead of semantics.
+ */
+export const ML_CATEGORIES = Object.freeze([
+    "subject",
+    "species",
+    "anatomy",
+    "appearance",
+    "pose",
+    "expression",
+    "clothing",
+    "sexual",
+    "aesthetic",
+    "style",
+    "camera",
+    "lighting",
+    "environment",
+    "quality",
+    "defect",
+    "text_metadata",
+]);
+
+export const OVERRIDE_ONLY_CATEGORIES =
+    Object.freeze(["artist"]);
 
 export const SYNTAX_CATEGORIES =
     Object.freeze(["lora", "embedding", "wildcard"]);
@@ -76,18 +101,17 @@ export const SYNTAX_CATEGORIES =
 export const ALL_CATEGORIES =
     Object.freeze([
         ...ML_CATEGORIES,
+        ...OVERRIDE_ONLY_CATEGORIES,
         ...SYNTAX_CATEGORIES,
         "other",
     ]);
 
 /*
- * MiniLM cosine scores from the real browser benchmark clustered around
- * ~0.23–0.54 for useful semantic matches. A 0.20 floor rejects weak/opaque
- * tags while retaining the observed good booru-style matches. Margin is not
- * used by default because several valid categories are naturally close in
- * embedding space; it remains configurable in Settings.
+ * LinearSVC decision-function values are not cosine similarities or calibrated
+ * probabilities. Until rejection thresholds are calibrated separately from
+ * OOF data, production uses pure argmax.
  */
-export const DEFAULT_MIN_SCORE = 0.20;
+export const DEFAULT_MIN_SCORE = Number.NEGATIVE_INFINITY;
 export const DEFAULT_MIN_MARGIN = 0.0;
 
 
@@ -106,7 +130,7 @@ export function normalizeCategory(category) {
 export function scoresToRecord(tag, scores) {
     if (!Array.isArray(scores) || !scores.length) {
         throw new Error(
-            "Invalid cosine classifier output: expected a non-empty score array"
+            "Invalid classifier output: expected a non-empty score array"
         );
     }
 
@@ -117,7 +141,7 @@ export function scoresToRecord(tag, scores) {
 
     if (ranked.some((item) => !Number.isFinite(item.score))) {
         throw new Error(
-            "Invalid cosine classifier output: score must be finite"
+            "Invalid classifier output: score must be finite"
         );
     }
 

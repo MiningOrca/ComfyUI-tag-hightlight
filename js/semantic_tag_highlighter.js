@@ -11,7 +11,6 @@ import {
     ALL_CATEGORIES,
     DEFAULT_MIN_MARGIN,
     DEFAULT_MIN_SCORE,
-    ML_CATEGORIES,
     MODEL_VERSION,
     TAXONOMY_VERSION,
     classificationCacheKey,
@@ -65,8 +64,6 @@ const COLOR_DEFAULTS = {
 const SETTINGS = {
     enabled: "SemanticTagHighlighter.Enabled",
     debugLogging: "SemanticTagHighlighter.DebugLogging",
-    minScore: "SemanticTagHighlighter.CosineMinScore",
-    minMargin: "SemanticTagHighlighter.CosineMinMargin",
     colors: Object.fromEntries(
         Object.keys(COLOR_DEFAULTS).map(
             (category) => [
@@ -145,11 +142,11 @@ function getColor(category) {
 }
 
 function minScore() {
-    return Number(settingValue(SETTINGS.minScore, DEFAULT_MIN_SCORE));
+    return DEFAULT_MIN_SCORE;
 }
 
 function minMargin() {
-    return Number(settingValue(SETTINGS.minMargin, DEFAULT_MIN_MARGIN));
+    return DEFAULT_MIN_MARGIN;
 }
 
 function pluginEnabled() {
@@ -2084,44 +2081,6 @@ app.registerExtension({
                 "Logs queue/cache/model decisions as console tables, including score, margin and rejection reason.",
             type: "boolean",
             defaultValue: true,
-        },
-        {
-            id: SETTINGS.minScore,
-            category: [
-                "Semantic Tag Highlighter",
-                "Classifier",
-                "Minimum score",
-            ],
-            name: "Minimum classification score",
-            tooltip:
-                "Below this MiniLM cosine similarity the tag stays uncolored.",
-            type: "slider",
-            attrs: {
-                min: 0,
-                max: 1,
-                step: 0.01,
-            },
-            defaultValue: DEFAULT_MIN_SCORE,
-            onChange: () => refreshAll(),
-        },
-        {
-            id: SETTINGS.minMargin,
-            category: [
-                "Semantic Tag Highlighter",
-                "Classifier",
-                "Minimum margin",
-            ],
-            name: "Minimum winner margin",
-            tooltip:
-                "Best cosine similarity must beat the second-best category by at least this amount.",
-            type: "slider",
-            attrs: {
-                min: 0,
-                max: 0.25,
-                step: 0.01,
-            },
-            defaultValue: DEFAULT_MIN_MARGIN,
-            onChange: () => refreshAll(),
         },
         ...colorSettings,
     ],
