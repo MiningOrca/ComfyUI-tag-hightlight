@@ -16,6 +16,8 @@ export class PromptHighlighter {
     constructor(controller) {
         this.controller = controller;
         this.textarea = controller.textarea;
+        this.updateRevision = 0;
+        this.destroyed = false;
 
         this.overlay = document.createElement("div");
         this.content = document.createElement("div");
@@ -52,10 +54,19 @@ export class PromptHighlighter {
         this.textarea.addEventListener("input", this.onInput);
         this.textarea.addEventListener("scroll", this.onScroll);
 
+        this.resizeObserver = new ResizeObserver(
+            () => this.syncStyle()
+        );
+        this.resizeObserver.observe(this.textarea);
+
         this.update();
     }
 
     destroy() {
+        this.destroyed = true;
+        this.updateRevision += 1;
+        this.resizeObserver.disconnect();
+
         this.textarea.removeEventListener("input", this.onInput);
         this.textarea.removeEventListener("scroll", this.onScroll);
 
@@ -66,7 +77,21 @@ export class PromptHighlighter {
     }
 
     syncStyle() {
+        if (this.destroyed) return;
+
         const textarea = this.textarea;
+        const currentHost =
+            textarea.offsetParent ??
+            textarea.parentElement;
+
+        if (
+            currentHost &&
+            currentHost !== this.overlayHost
+        ) {
+            currentHost.appendChild(this.overlay);
+            this.overlayHost = currentHost;
+        }
+
         const computed = getComputedStyle(textarea);
         /*
          * Overlay and textarea now share the same offset parent, so ComfyUI's
@@ -120,7 +145,9 @@ export class PromptHighlighter {
     }
 
     async update() {
-        const segments = parsePrompt(this.textarea.value);
+        const revision = ++this.updateRevision;
+        const value = this.textarea.value;
+        const segments = parsePrompt(value);
         const modelTags = [
             ...new Set(
                 segments
@@ -136,6 +163,15 @@ export class PromptHighlighter {
         this.render(segments);
 
         await hydrateTags(modelTags);
+
+        if (
+            this.destroyed ||
+            revision !== this.updateRevision ||
+            value !== this.textarea.value
+        ) {
+            return;
+        }
+
         this.render(segments);
         for (const segment of segments) {
             if (

@@ -60,8 +60,6 @@ export function scanAllNodes() {
         scanNode(node);
     }
     for (const controller of [...controllers]) {
-        if (!controller.textarea.isConnected) {
-            controller.destroy();
-        }
+        controller.syncDomState();
     }
 }

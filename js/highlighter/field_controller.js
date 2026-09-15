@@ -100,7 +100,7 @@ export class FieldController {
         this.highlighter = null;
     }
 
-    position() {
+    syncDomState() {
         if (!this.textarea.isConnected) {
             this.destroy();
             return;

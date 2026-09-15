@@ -22,15 +22,6 @@ import {
 import { injectCss } from "./ui/styles.js";
 
 let scanTimer = null;
-let rafId = null;
-
-function positionLoop() {
-    for (const controller of [...controllers]) {
-        controller.position();
-    }
-
-    rafId = requestAnimationFrame(positionLoop);
-}
 
 function refreshAll() {
     for (const controller of [...controllers]) {
@@ -116,12 +107,6 @@ app.registerExtension({
             scanTimer = setInterval(
                 scanAllNodes,
                 700
-            );
-        }
-
-        if (!rafId) {
-            rafId = requestAnimationFrame(
-                positionLoop
             );
         }
     }
