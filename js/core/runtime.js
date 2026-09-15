@@ -116,7 +116,7 @@ export function pluginEnabled() {
 }
 
 export function debugLoggingEnabled() {
-    return Boolean(settingValue(SETTINGS.debugLogging, true));
+    return Boolean(settingValue(SETTINGS.debugLogging, false));
 }
 
 export function getNodeState(node) {

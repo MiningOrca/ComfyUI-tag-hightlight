@@ -75,7 +75,7 @@ app.registerExtension({
             tooltip:
                 "Logs queue/cache/model decisions as console tables, including score, margin and rejection reason.",
             type: "boolean",
-            defaultValue: true,
+            defaultValue: false,
         },
         ...colorSettings,
     ],

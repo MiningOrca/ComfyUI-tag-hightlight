@@ -67,32 +67,60 @@ export class ClassificationCoordinator {
             (event) => this.onMessage(event.data)
         );
         this.worker.addEventListener("error", (event) => {
-            this.failed = true;
-            this.busy = false;
-            diagnosticState.busy = false;
-            diagnosticState.error =
-                event.message ||
-                "Classifier worker failed";
-            diagnosticState.phase = "error";
-            diagnosticState.message =
-                diagnosticState.error;
-            this.resolveIdleWaiters();
-            debugLog(
-                "error",
-                "classifier worker error",
-                event
-            );
-            renderGlobalStatus();
-
-            toast(
-                "error",
-                "Semantic Tag Highlighter",
-                event.message ||
-                    "Classifier worker failed"
-            );
+            this.failWorker(event);
         });
 
         return this.worker;
+    }
+
+    failWorker(error) {
+        const message =
+            error?.message ||
+            "Classifier worker failed";
+        const failure =
+            error instanceof Error
+                ? error
+                : new Error(message);
+
+        clearTimeout(this.timer);
+        this.timer = null;
+
+        const worker = this.worker;
+        this.worker = null;
+        try {
+            worker?.terminate();
+        } catch {}
+
+        for (const request of this.inflight.values()) {
+            request.reject?.(failure);
+        }
+
+        this.inflight.clear();
+        this.pending.clear();
+        this.queuedOrInflight.clear();
+        this.busy = false;
+        this.failed = true;
+
+        diagnosticState.busy = false;
+        diagnosticState.queued = 0;
+        diagnosticState.batchStartedAt = null;
+        diagnosticState.error = message;
+        diagnosticState.phase = "error";
+        diagnosticState.message = message;
+
+        debugLog(
+            "error",
+            "classifier worker error",
+            error
+        );
+        renderGlobalStatus();
+        this.resolveIdleWaiters();
+
+        toast(
+            "error",
+            "Semantic Tag Highlighter",
+            message
+        );
     }
 
     queue(tag, text) {
