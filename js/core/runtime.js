@@ -205,6 +205,25 @@ export function getTextareas(widget) {
         }
     }
 
+    // References such as widget.inputEl can point at a different textarea
+    // across node creation/restoration. Normalize connected elements to their
+    // actual DOM order so index-based field identity remains stable on reload.
+    found.sort((left, right) => {
+        if (left === right) return 0;
+        if (
+            !left.isConnected ||
+            !right.isConnected ||
+            left.getRootNode() !== right.getRootNode()
+        ) {
+            return 0;
+        }
+
+        const position = left.compareDocumentPosition(right);
+        if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+        if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+        return 0;
+    });
+
     return found;
 }
 

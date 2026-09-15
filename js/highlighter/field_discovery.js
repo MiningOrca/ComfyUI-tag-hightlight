@@ -18,8 +18,17 @@ export function scanNode(node) {
 
         for (let index = 0; index < textareas.length; index += 1) {
             const textarea = textareas[index];
+            const existingController = controllersByTextarea.get(textarea);
 
-            if (controllersByTextarea.has(textarea)) {
+            if (existingController) {
+                /*
+                 * A controller can be created from nodeCreated before ComfyUI
+                 * restores node.properties from the workflow. Re-read the
+                 * persisted enabled state whenever the field is rediscovered,
+                 * especially from loadedGraphNode / the periodic scanner.
+                 */
+                existingController.syncEnabledState();
+                existingController.syncDomState();
                 continue;
             }
 
